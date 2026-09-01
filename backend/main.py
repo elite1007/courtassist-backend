@@ -13,11 +13,24 @@ a public VPS, put it behind HTTPS + a shared bearer token (see README) so a
 stranger can't hit your endpoints, upload into your session, or burn your
 Perplexity API quota.
 """
+import os
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Optional shared-secret gate. If APP_SHARED_TOKEN is set in the environment
+# (as it is on the hosted deployment), every request must carry a matching
+# X-App-Token header. This stops a stranger who finds the public URL from
+# burning your Perplexity quota. Local/dev runs without this env var skip the
+# check entirely.
+_APP_SHARED_TOKEN = os.environ.get("APP_SHARED_TOKEN")
+
+
+def require_app_token(x_app_token: Optional[str] = Header(default=None)) -> None:
+    if _APP_SHARED_TOKEN and x_app_token != _APP_SHARED_TOKEN:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-App-Token header.")
 
 import extraction
 import perplexity
@@ -31,9 +44,13 @@ app.add_middleware(
 
 
 def _key(x_perplexity_key: Optional[str]) -> str:
-    if not x_perplexity_key:
-        raise HTTPException(400, "Missing X-Perplexity-Key header. Add your Perplexity API key in the app's Settings screen.")
-    return x_perplexity_key
+    # Prefer a key sent by the app; fall back to one baked into this hosted
+    # deployment's environment (PERPLEXITY_API_KEY) so the app never has to
+    # ask you for a key at all.
+    key = x_perplexity_key or os.environ.get("PERPLEXITY_API_KEY")
+    if not key:
+        raise HTTPException(400, "No Perplexity API key available. Set PERPLEXITY_API_KEY on the server, or add one in the app's Settings screen.")
+    return key
 
 
 # ---------- Sessions ----------
@@ -42,13 +59,13 @@ class CreateSessionBody(BaseModel):
     title: str = ""
 
 
-@app.post("/sessions")
+@app.post("/sessions", dependencies=[Depends(require_app_token)])
 def create_session(body: CreateSessionBody):
     sid = store.create_session(body.title)
     return {"session_id": sid}
 
 
-@app.get("/sessions/{session_id}")
+@app.get("/sessions/{session_id}", dependencies=[Depends(require_app_token)])
 def get_session(session_id: str):
     s = store.get_session(session_id)
     if not s:
@@ -63,7 +80,7 @@ def get_session(session_id: str):
 
 # ---------- Case context (multi-file upload) ----------
 
-@app.post("/sessions/{session_id}/context/file")
+@app.post("/sessions/{session_id}/context/file", dependencies=[Depends(require_app_token)])
 async def upload_context_file(session_id: str, file: UploadFile = File(...)):
     if not store.get_session(session_id):
         raise HTTPException(404, "Session not found")
@@ -79,7 +96,7 @@ class TextContextBody(BaseModel):
     text: str
 
 
-@app.post("/sessions/{session_id}/context/text")
+@app.post("/sessions/{session_id}/context/text", dependencies=[Depends(require_app_token)])
 def upload_context_text(session_id: str, body: TextContextBody):
     if not store.get_session(session_id):
         raise HTTPException(404, "Session not found")
@@ -87,7 +104,7 @@ def upload_context_text(session_id: str, body: TextContextBody):
     return {"ok": True}
 
 
-@app.get("/sessions/{session_id}/context")
+@app.get("/sessions/{session_id}/context", dependencies=[Depends(require_app_token)])
 def list_context(session_id: str):
     if not store.get_session(session_id):
         raise HTTPException(404, "Session not found")
@@ -102,7 +119,7 @@ class TranscriptBody(BaseModel):
     text: str
 
 
-@app.post("/sessions/{session_id}/transcript")
+@app.post("/sessions/{session_id}/transcript", dependencies=[Depends(require_app_token)])
 async def post_transcript(session_id: str, body: TranscriptBody,
                            x_perplexity_key: Optional[str] = Header(None)):
     if not store.get_session(session_id):
@@ -138,7 +155,7 @@ async def post_transcript(session_id: str, body: TranscriptBody,
     return {"actionable": True, **suggestion}
 
 
-@app.get("/sessions/{session_id}/suggestions")
+@app.get("/sessions/{session_id}/suggestions", dependencies=[Depends(require_app_token)])
 def get_suggestions(session_id: str, since: int = -1):
     if not store.get_session(session_id):
         raise HTTPException(404, "Session not found")
@@ -151,7 +168,7 @@ class DraftDocBody(BaseModel):
     instruction: str
 
 
-@app.post("/sessions/{session_id}/draft/document")
+@app.post("/sessions/{session_id}/draft/document", dependencies=[Depends(require_app_token)])
 async def draft_document(session_id: str, body: DraftDocBody,
                           x_perplexity_key: Optional[str] = Header(None)):
     if not store.get_session(session_id):
@@ -170,7 +187,7 @@ class DraftEmailBody(BaseModel):
     instruction: str
 
 
-@app.post("/sessions/{session_id}/draft/email")
+@app.post("/sessions/{session_id}/draft/email", dependencies=[Depends(require_app_token)])
 async def draft_email(session_id: str, body: DraftEmailBody,
                        x_perplexity_key: Optional[str] = Header(None)):
     if not store.get_session(session_id):
@@ -189,7 +206,7 @@ async def draft_email(session_id: str, body: DraftEmailBody,
     # has Gmail credentials and can never send on its own.
 
 
-@app.get("/sessions/{session_id}/drafts")
+@app.get("/sessions/{session_id}/drafts", dependencies=[Depends(require_app_token)])
 def list_drafts(session_id: str):
     s = store.get_session(session_id)
     if not s:

@@ -16,6 +16,7 @@ venv/
 env/
 .pytest_cache/
 sessions_data/
+backend/data/
 *.sqlite3
 
 # --- Android / Gradle ---
