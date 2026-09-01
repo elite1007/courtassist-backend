@@ -1,0 +1,40 @@
+# --- Secrets / env ---
+.env
+.env.*
+*.pem
+*.key
+secrets/
+**/secrets/
+
+# --- Python (backend) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+sessions_data/
+*.sqlite3
+
+# --- Android / Gradle ---
+android/.gradle/
+android/build/
+android/app/build/
+android/*/build/
+android/.idea/
+android/local.properties
+android/*.iml
+android/.cxx/
+android/captures/
+android/.externalNativeBuild/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+
+# --- Build outputs we ship separately via Drive, not via git ---
+CourtAssist-debug.apk
