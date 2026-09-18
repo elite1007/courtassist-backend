@@ -18,18 +18,54 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-API_URL = "https://api.perplexity.ai/chat/completions"
+# Perplexity retired the Sonar /chat/completions API in favor of the Agent
+# API (POST /v1/agent, OpenAI-Responses-shaped request/response). See
+# https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview
+API_URL = "https://api.perplexity.ai/v1/agent"
 
-ANALYSIS_MODEL = "sonar-reasoning-pro"   # search-grounded reasoning, returns citations
-VERIFY_MODEL = "sonar-pro"               # fast, independent corroboration search
-DRAFT_MODEL = "sonar-reasoning-pro"      # for document/email drafting
+# Presets replace the old model names. Each preset bundles a model, system
+# prompt, and built-in web search -- the same "search-grounded answer with
+# citations" behavior the old sonar/sonar-reasoning-pro models provided.
+ANALYSIS_PRESET = "high"   # deeper reasoning w/ citations, replaces sonar-reasoning-pro
+VERIFY_PRESET = "low"      # fast independent corroboration search, replaces sonar-pro
+DRAFT_PRESET = "high"      # for document/email drafting, replaces sonar-reasoning-pro
 
 
 class PerplexityError(RuntimeError):
     pass
 
 
-async def _chat(api_key: str, model: str, messages: List[Dict[str, str]],
+def _parse_agent_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten an Agent API ResponsesResponse into the shape the rest of this
+    module expects: {content, citations, search_results}."""
+    status = resp.get("status")
+    if status not in (None, "completed"):
+        err = resp.get("error") or {}
+        raise PerplexityError(
+            f"Perplexity Agent API response status={status}: {err.get('message', resp)}"[:500]
+        )
+    text_parts: List[str] = []
+    search_results: List[Dict[str, Any]] = []
+    citations: List[str] = []
+    for item in resp.get("output") or []:
+        item_type = item.get("type")
+        if item_type == "message":
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text" and part.get("text"):
+                    text_parts.append(part["text"])
+        elif item_type == "search_results":
+            for r in item.get("results") or []:
+                search_results.append({
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "snippet": r.get("snippet", ""),
+                })
+                if r.get("url"):
+                    citations.append(r["url"])
+    return {"content": "".join(text_parts), "citations": citations, "search_results": search_results}
+
+
+async def _chat(api_key: str, preset: str, system_prompt: str, user_content: str,
                  max_tokens: int = 1200) -> Dict[str, Any]:
     if not api_key:
         raise PerplexityError("Missing Perplexity API key. Add it in the app's Settings screen.")
@@ -37,12 +73,19 @@ async def _chat(api_key: str, model: str, messages: List[Dict[str, str]],
     # pasted into a hosting dashboard) makes this an invalid HTTP header
     # value and httpx/httpcore raises LocalProtocolError on every request.
     headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    body = {
+        "input": user_content,
+        "instructions": system_prompt,
+        "preset": preset,
+        "tools": [{"type": "web_search"}],
+        "max_output_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(API_URL, headers=headers, json=body)
     if r.status_code != 200:
         raise PerplexityError(f"Perplexity API error {r.status_code}: {r.text[:500]}")
-    return r.json()
+    return _parse_agent_response(r.json())
 
 
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
@@ -103,11 +146,8 @@ async def analyze_transcript(api_key: str, case_context: str, recent_lines: List
         f"NEWEST LINE ({newest_speaker}): {newest_text}\n\n"
         "Analyze the newest line per your instructions and respond with the JSON object only."
     )
-    resp = await _chat(api_key, ANALYSIS_MODEL, [
-        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ])
-    content = resp["choices"][0]["message"]["content"]
+    resp = await _chat(api_key, ANALYSIS_PRESET, ANALYSIS_SYSTEM_PROMPT, user_prompt)
+    content = resp["content"]
     parsed = _extract_json_block(content)
     citations_meta = resp.get("citations") or []
     search_results = resp.get("search_results") or []
@@ -128,11 +168,12 @@ complete the draft is missing, insert a clearly marked placeholder like \
 
 
 async def draft_document(api_key: str, case_context: str, instruction: str) -> str:
-    resp = await _chat(api_key, DRAFT_MODEL, [
-        {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
-        {"role": "user", "content": f"CASE MATERIALS:\n{case_context}\n\nINSTRUCTION:\n{instruction}"},
-    ], max_tokens=2000)
-    return resp["choices"][0]["message"]["content"]
+    resp = await _chat(
+        api_key, DRAFT_PRESET, DRAFT_SYSTEM_PROMPT,
+        f"CASE MATERIALS:\n{case_context}\n\nINSTRUCTION:\n{instruction}",
+        max_tokens=2000,
+    )
+    return resp["content"]
 
 
 EMAIL_SYSTEM_PROMPT = """You draft a single email on behalf of a self-represented \
@@ -143,11 +184,12 @@ address."""
 
 
 async def draft_email(api_key: str, case_context: str, instruction: str) -> Dict[str, str]:
-    resp = await _chat(api_key, DRAFT_MODEL, [
-        {"role": "system", "content": EMAIL_SYSTEM_PROMPT},
-        {"role": "user", "content": f"CASE MATERIALS:\n{case_context}\n\nINSTRUCTION:\n{instruction}"},
-    ], max_tokens=1200)
-    content = resp["choices"][0]["message"]["content"]
+    resp = await _chat(
+        api_key, DRAFT_PRESET, EMAIL_SYSTEM_PROMPT,
+        f"CASE MATERIALS:\n{case_context}\n\nINSTRUCTION:\n{instruction}",
+        max_tokens=1200,
+    )
+    content = resp["content"]
     parsed = _extract_json_block(content)
     if parsed is None:
         return {"to": "", "subject": "Draft", "body": content}
@@ -191,11 +233,8 @@ async def answer_question(api_key: str, case_context: str, recent_lines: List[Di
         f"QUESTION FROM USER: {question}\n\n"
         "Answer per your instructions and respond with the JSON object only."
     )
-    resp = await _chat(api_key, ANALYSIS_MODEL, [
-        {"role": "system", "content": ASK_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ])
-    content = resp["choices"][0]["message"]["content"]
+    resp = await _chat(api_key, ANALYSIS_PRESET, ASK_SYSTEM_PROMPT, user_prompt)
+    content = resp["content"]
     parsed = _extract_json_block(content)
     citations_meta = resp.get("citations") or []
     search_results = resp.get("search_results") or []
@@ -209,11 +248,9 @@ async def answer_question(api_key: str, case_context: str, recent_lines: List[Di
 
 async def independent_search(api_key: str, query: str) -> Dict[str, Any]:
     """A deliberately separate, narrow search call used only for verification."""
-    resp = await _chat(api_key, VERIFY_MODEL, [
-        {"role": "system", "content": "Answer factually and briefly. Cite exact sources."},
-        {"role": "user", "content": query},
-    ], max_tokens=500)
-    content = resp["choices"][0]["message"]["content"]
-    citations = resp.get("citations") or []
-    search_results = resp.get("search_results") or []
-    return {"content": content, "citations": citations, "search_results": search_results}
+    resp = await _chat(
+        api_key, VERIFY_PRESET, "Answer factually and briefly. Cite exact sources.", query,
+        max_tokens=500,
+    )
+    return {"content": resp["content"], "citations": resp.get("citations") or [],
+            "search_results": resp.get("search_results") or []}
