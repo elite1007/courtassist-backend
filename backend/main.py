@@ -48,6 +48,12 @@ def _key(x_perplexity_key: Optional[str]) -> str:
     # deployment's environment (PERPLEXITY_API_KEY) so the app never has to
     # ask you for a key at all.
     key = x_perplexity_key or os.environ.get("PERPLEXITY_API_KEY")
+    # Env vars pasted into a dashboard (or values copy-pasted with a
+    # trailing newline) commonly pick up leading/trailing whitespace. A
+    # stray "\n" in an Authorization header value makes httpx/httpcore
+    # raise LocalProtocolError ("Illegal header value") on every single
+    # request -- this was silently breaking every AI call in production.
+    key = key.strip() if key else key
     if not key:
         raise HTTPException(400, "No Perplexity API key available. Set PERPLEXITY_API_KEY on the server, or add one in the app's Settings screen.")
     return key

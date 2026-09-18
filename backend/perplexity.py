@@ -33,7 +33,10 @@ async def _chat(api_key: str, model: str, messages: List[Dict[str, str]],
                  max_tokens: int = 1200) -> Dict[str, Any]:
     if not api_key:
         raise PerplexityError("Missing Perplexity API key. Add it in the app's Settings screen.")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    # Defensive: a stray newline/whitespace in the key (e.g. from an env var
+    # pasted into a hosting dashboard) makes this an invalid HTTP header
+    # value and httpx/httpcore raises LocalProtocolError on every request.
+    headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
     body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2}
     async with httpx.AsyncClient(timeout=45.0) as client:
         r = await client.post(API_URL, headers=headers, json=body)
