@@ -151,6 +151,59 @@ async def draft_email(api_key: str, case_context: str, instruction: str) -> Dict
     return parsed
 
 
+ASK_SYSTEM_PROMPT = """You are a real-time courtroom co-counsel assistant answering a \
+direct question typed by a self-represented litigant, either during hearing prep or \
+mid-hearing. You are given (a) the user's own uploaded case materials and (b) a \
+rolling transcript of the live hearing so far (may be empty). Answer the question \
+directly and usefully, grounded in the case materials and real, verifiable legal \
+authority (case law, statutes, rules of procedure) wherever relevant.
+
+Rules:
+- Always answer -- this was explicitly asked for, so never say "not actionable".
+- NEVER invent a citation. Only cite sources you would stand behind if someone \
+looked them up right now. If you are not certain a citation is real, omit it \
+rather than guess.
+- Prefer citing the user's own uploaded case materials when directly relevant, in \
+addition to outside legal authority.
+- Keep the answer concise enough to read in 15-20 seconds if this is mid-hearing.
+
+Respond with ONLY a JSON object, no other text, matching exactly:
+{
+  "answer": "<direct, usable answer to the question>",
+  "citations": [
+    {"label": "<short readable name, e.g. 'Fed. R. Civ. P. 56(a)' or case name>",
+     "detail": "<what this source establishes, one sentence>",
+     "source_hint": "<best URL or identifying string you have for this, may be empty>"}
+  ]
+}
+"""
+
+
+async def answer_question(api_key: str, case_context: str, recent_lines: List[Dict[str, Any]],
+                           question: str) -> Dict[str, Any]:
+    transcript_str = "\n".join(f"{l.get('speaker', '?')}: {l['text']}" for l in recent_lines)
+    user_prompt = (
+        f"UPLOADED CASE MATERIALS (may be empty):\n{case_context or '(none uploaded yet)'}\n\n"
+        f"RECENT TRANSCRIPT (may be empty):\n{transcript_str or '(none yet)'}\n\n"
+        f"QUESTION FROM USER: {question}\n\n"
+        "Answer per your instructions and respond with the JSON object only."
+    )
+    resp = await _chat(api_key, ANALYSIS_MODEL, [
+        {"role": "system", "content": ASK_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ])
+    content = resp["choices"][0]["message"]["content"]
+    parsed = _extract_json_block(content)
+    citations_meta = resp.get("citations") or []
+    search_results = resp.get("search_results") or []
+    if parsed is None:
+        return {"answer": content, "citations": [], "_model_citations": citations_meta,
+                "_model_search_results": search_results}
+    parsed["_model_citations"] = citations_meta
+    parsed["_model_search_results"] = search_results
+    return parsed
+
+
 async def independent_search(api_key: str, query: str) -> Dict[str, Any]:
     """A deliberately separate, narrow search call used only for verification."""
     resp = await _chat(api_key, VERIFY_MODEL, [

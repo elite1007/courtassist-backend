@@ -162,6 +162,47 @@ def get_suggestions(session_id: str, since: int = -1):
     return store.suggestions_since(session_id, since)
 
 
+# ---------- On-demand question ("give it instructions" / ask anytime) ----------
+
+class AskBody(BaseModel):
+    question: str
+
+
+@app.post("/sessions/{session_id}/ask", dependencies=[Depends(require_app_token)])
+async def ask_question(session_id: str, body: AskBody,
+                        x_perplexity_key: Optional[str] = Header(None)):
+    """Lets the user type a direct question or instruction at any time (not
+    just react to detected opposing arguments) -- e.g. \"what's my strongest
+    argument against a hearsay objection here?\" Always answers (unlike
+    /transcript, which only responds when something is actionable), and goes
+    through the same triple-check citation verification before returning.
+    """
+    if not store.get_session(session_id):
+        raise HTTPException(404, "Session not found")
+    api_key = _key(x_perplexity_key)
+    recent = store.recent_transcript(session_id, n=30)
+    case_context = store.context_blob(session_id)
+
+    try:
+        analysis = await perplexity.answer_question(api_key, case_context, recent, body.question)
+    except perplexity.PerplexityError as e:
+        raise HTTPException(502, str(e))
+
+    search_pool = (analysis.get("_model_search_results") or []) + [
+        {"url": u, "title": ""} for u in (analysis.get("_model_citations") or [])
+    ]
+    raw_citations = analysis.get("citations") or []
+    verified_citations = await verify.verify_all(api_key, raw_citations, search_pool)
+
+    suggestion = store.add_suggestion(
+        session_id,
+        trigger_text=f"You asked: {body.question}",
+        counter_argument=analysis.get("answer", ""),
+        citations=verified_citations,
+    )
+    return {"actionable": True, **suggestion}
+
+
 # ---------- Drafting (documents & emails) ----------
 
 class DraftDocBody(BaseModel):

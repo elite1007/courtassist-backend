@@ -21,6 +21,7 @@ distinguish them (e.g. greyed out with a "not independently confirmed --
 verify before relying on this" warning) instead of presenting them as
 equally trustworthy fact.
 """
+import asyncio
 import re
 from typing import Any, Dict, List
 from urllib.parse import urlparse
@@ -28,6 +29,14 @@ from urllib.parse import urlparse
 import httpx
 
 from perplexity import independent_search
+
+# Verifying every citation sequentially (fetch + a second Perplexity search per
+# citation) can take well over a minute wall-clock with several citations,
+# which is too slow to be useful mid-hearing and can exceed the phone's HTTP
+# timeout. Run them concurrently and cap both citation count and per-check
+# time so the whole pipeline stays bounded.
+_MAX_CITATIONS_VERIFIED = 4
+_MAX_CONCURRENT_VERIFICATIONS = 4
 
 _STOPWORDS = {
     "the", "a", "an", "of", "and", "or", "in", "on", "for", "to", "v", "vs",
@@ -63,7 +72,7 @@ def _candidate_urls(citation: Dict[str, Any]) -> List[str]:
 
 async def _fetch_ok(url: str, needle_tokens: List[str]) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True,
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True,
                                       headers={"User-Agent": _UA}) as client:
             r = await client.get(url)
         if r.status_code >= 400:
@@ -96,16 +105,20 @@ async def verify_citation(api_key: str, citation: Dict[str, Any]) -> Dict[str, A
         for sr in citation.get("_search_results_pool", [])
     )
 
-    # Check 2: direct fetch of a candidate URL by the backend itself.
+    # Check 2: direct fetch of candidate URLs by the backend itself, tried
+    # concurrently (at most 2) rather than one-by-one, to bound latency.
     fetch_result = {"ok": False, "reason": "No fetchable URL found for this citation"}
     verified_url = None
-    for url in _candidate_urls(citation):
-        result = await _fetch_ok(url, needle_tokens)
-        if result["ok"]:
+    candidate_urls = _candidate_urls(citation)[:2]
+    if candidate_urls:
+        fetch_results = await asyncio.gather(
+            *(_fetch_ok(url, needle_tokens) for url in candidate_urls),
+        )
+        for url, result in zip(candidate_urls, fetch_results):
             fetch_result = result
-            verified_url = url
-            break
-        fetch_result = result  # keep last failure reason if none succeed
+            if result["ok"]:
+                verified_url = url
+                break
 
     # Check 3: independent corroboration via a fresh, separate search call.
     corroboration_ok = False
@@ -147,12 +160,20 @@ async def verify_citation(api_key: str, citation: Dict[str, Any]) -> Dict[str, A
 
 async def verify_all(api_key: str, citations: List[Dict[str, Any]],
                       search_pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Cap how many citations get the full verification treatment -- a model
+    # response with many citations would otherwise multiply total latency.
+    capped = citations[:_MAX_CITATIONS_VERIFIED]
     enriched = []
-    for c in citations:
+    for c in capped:
         c = dict(c)
         c["_search_results_pool"] = search_pool
         enriched.append(c)
-    out = []
-    for c in enriched:
-        out.append(await verify_citation(api_key, c))
+
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_VERIFICATIONS)
+
+    async def _bounded(c: Dict[str, Any]) -> Dict[str, Any]:
+        async with semaphore:
+            return await verify_citation(api_key, c)
+
+    out = list(await asyncio.gather(*(_bounded(c) for c in enriched)))
     return out
