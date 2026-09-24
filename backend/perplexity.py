@@ -103,16 +103,25 @@ def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-ANALYSIS_SYSTEM_PROMPT = """You are a real-time courtroom co-counsel assistant. \
+ANALYSIS_SYSTEM_PROMPT = """You are a real-time courtroom co-counsel assistant helping a \
+self-represented PLAINTIFF during their own hearing. \
 You are given (a) the user's own uploaded case materials, (b) a rolling transcript \
-of a live hearing, and (c) the newest line spoken. Your ONLY job right now is to \
-decide whether the newest line is an argument, claim, or factual assertion made by \
-the opposing side (or the judge raising a point) that the user could benefit from \
-rebutting -- and if so, draft a concise, usable counter-argument with real, \
-verifiable legal citations (case law, statutes, rules of procedure, or the user's \
-own case documents).
+of a live hearing where every line is tagged with WHO said it (Plaintiff (Me) == \
+the user you are helping; Defendant / Opposing Counsel; Judge; Witness; or a \
+custom/unclear label), and (c) the newest line spoken, also tagged with its \
+speaker role. Your ONLY job right now is to decide whether the newest line is an \
+argument, claim, ruling, or factual assertion made by someone OTHER than the \
+Plaintiff -- i.e. the Defendant/Opposing Counsel, the Judge, or a Witness -- that \
+the Plaintiff could benefit from rebutting or responding to -- and if so, draft a \
+concise, usable response with real, verifiable legal citations (case law, \
+statutes, rules of procedure, or the user's own case documents).
 
 Rules:
+- Trust the given speaker role tag; do not re-guess who is speaking from wording \
+alone.
+- If the newest line's speaker role is \"Plaintiff (Me)\" (the user's own words), \
+this is NEVER actionable -- the user does not need a rebuttal to themselves. Mark \
+it not actionable immediately, regardless of content.
 - If the newest line is small talk, procedural chatter, or nothing worth reacting \
 to, say so plainly.
 - NEVER invent a citation. Only cite sources you would stand behind if someone \
@@ -139,12 +148,13 @@ Respond with ONLY a JSON object, no other text, matching exactly:
 
 async def analyze_transcript(api_key: str, case_context: str, recent_lines: List[Dict[str, Any]],
                               newest_speaker: str, newest_text: str) -> Dict[str, Any]:
-    transcript_str = "\n".join(f"{l.get('speaker', '?')}: {l['text']}" for l in recent_lines)
+    transcript_str = "\n".join(f"[{l.get('speaker', '?')}]: {l['text']}" for l in recent_lines)
     user_prompt = (
         f"UPLOADED CASE MATERIALS (may be empty):\n{case_context or '(none uploaded yet)'}\n\n"
-        f"RECENT TRANSCRIPT:\n{transcript_str}\n\n"
-        f"NEWEST LINE ({newest_speaker}): {newest_text}\n\n"
-        "Analyze the newest line per your instructions and respond with the JSON object only."
+        f"RECENT TRANSCRIPT (each line tagged [speaker role]):\n{transcript_str}\n\n"
+        f"NEWEST LINE -- speaker role: [{newest_speaker}] -- text: {newest_text}\n\n"
+        "Analyze the newest line per your instructions and respond with the JSON object only. "
+        "Remember: if the newest line's speaker role is \"Plaintiff (Me)\", it is never actionable."
     )
     resp = await _chat(api_key, ANALYSIS_PRESET, ANALYSIS_SYSTEM_PROMPT, user_prompt)
     content = resp["content"]
